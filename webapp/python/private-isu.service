@@ -1,0 +1,44 @@
+[Unit]
+Description=Private ISU v2 Python FastAPI Application
+After=network.target mysql.service redis-server.service
+Wants=mysql.service redis-server.service
+
+[Service]
+Type=exec
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/private_isu/webapp/python
+ExecStart=/home/isucon/private_isu/webapp/python/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --workers 4
+
+# 環境変数
+Environment=ISUCONP_DB_HOST=localhost
+Environment=ISUCONP_DB_PORT=3306
+Environment=ISUCONP_DB_USER=root
+Environment=ISUCONP_DB_PASSWORD=
+Environment=ISUCONP_DB_NAME=isuconp
+Environment=REDIS_HOST=localhost
+Environment=REDIS_PORT=6379
+Environment=REDIS_DB=0
+
+# リスタート設定
+Restart=always
+RestartSec=5
+
+# ログ設定
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=private-isu
+
+# セキュリティ設定
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www/images /tmp
+
+# リソース制限
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target 

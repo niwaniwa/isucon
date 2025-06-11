@@ -1,128 +1,147 @@
+import asyncio
 import datetime
+import hashlib
 import os
-import pathlib
 import re
 import shlex
 import subprocess
 import tempfile
+from typing import Optional, List, Dict, Any
+from functools import lru_cache
 
-import flask
-import MySQLdb.cursors
-from flask_session import Session
-from jinja2 import pass_eval_context
-from markupsafe import Markup, escape
-from pymemcache.client.base import Client as MemcacheClient
+import aiomysql
+import aiofiles
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException, Depends, Request, Form, File, UploadFile, status
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import uvicorn
 
+# Constants
 UPLOAD_LIMIT = 10 * 1024 * 1024  # 10mb
 POSTS_PER_PAGE = 20
-
-# 画像保存用ディレクトリ
 IMAGE_STORAGE_DIR = "/var/www/images"
 
-_config = None
+# FastAPI app setup
+app = FastAPI(title="Private ISU v2", version="2.0.0")
+templates = Jinja2Templates(directory="templates")
 
+# カスタムフィルタとグローバル関数を追加
+def image_url_filter(post):
+    """Template filter for image URL generation"""
+    ext = ""
+    if post["mime"] == "image/jpeg":
+        ext = ".jpg"
+    elif post["mime"] == "image/png":
+        ext = ".png"
+    elif post["mime"] == "image/gif":
+        ext = ".gif"
+    return f"/image/{post['id']}{ext}"
 
-def config():
-    global _config
-    if _config is None:
-        _config = {
-            "db": {
-                "host": os.environ.get("ISUCONP_DB_HOST", "localhost"),
-                "port": int(os.environ.get("ISUCONP_DB_PORT", "3306")),
-                "user": os.environ.get("ISUCONP_DB_USER", "root"),
-                "db": os.environ.get("ISUCONP_DB_NAME", "isuconp"),
-            },
-            "memcache": {
-                "address": os.environ.get(
-                    "ISUCONP_MEMCACHED_ADDRESS", "127.0.0.1:11211"
-                ),
-            },
+def nl2br_filter(value):
+    """Template filter for newline to br conversion"""
+    if not value:
+        return ""
+    # 改行を<br>タグに変換
+    return value.replace('\n', '<br>')
+
+# Jinja2環境のカスタマイズ
+templates.env.globals['image_url'] = image_url_filter
+templates.env.filters['nl2br'] = nl2br_filter
+
+# Static files
+app.mount("/css", StaticFiles(directory="../public/css"), name="css")
+app.mount("/js", StaticFiles(directory="../public/js"), name="js")
+app.mount("/img", StaticFiles(directory="../public/img"), name="img")
+
+# Global connections
+db_pool: Optional[aiomysql.Pool] = None
+redis_client: Optional[redis.Redis] = None
+
+# Pydantic models
+class User(BaseModel):
+    id: int
+    account_name: str
+    authority: int
+    del_flg: int
+    created_at: datetime.datetime
+
+class Post(BaseModel):
+    id: int
+    user_id: int
+    body: str
+    mime: str
+    created_at: datetime.datetime
+    comment_count: int = 0
+    comments: List[Dict[str, Any]] = []
+    user: Optional[Dict[str, Any]] = None
+
+class Comment(BaseModel):
+    id: int
+    post_id: int
+    user_id: int
+    comment: str
+    created_at: datetime.datetime
+    user: Optional[Dict[str, Any]] = None
+
+# Configuration
+@lru_cache()
+def get_config():
+    return {
+        "db": {
+            "host": os.environ.get("ISUCONP_DB_HOST", "localhost"),
+            "port": int(os.environ.get("ISUCONP_DB_PORT", "3306")),
+            "user": os.environ.get("ISUCONP_DB_USER", "root"),
+            "password": os.environ.get("ISUCONP_DB_PASSWORD", ""),
+            "db": os.environ.get("ISUCONP_DB_NAME", "isuconp"),
+        },
+        "redis": {
+            "host": os.environ.get("REDIS_HOST", "localhost"),
+            "port": int(os.environ.get("REDIS_PORT", "6379")),
+            "db": int(os.environ.get("REDIS_DB", "0")),
         }
-        password = os.environ.get("ISUCONP_DB_PASSWORD")
-        if password:
-            _config["db"]["passwd"] = password
-    return _config
+    }
 
-
-_db = None
-
-
-def db():
-    global _db
-    if _db is None:
-        conf = config()["db"].copy()
-        conf["charset"] = "utf8mb4"
-        conf["cursorclass"] = MySQLdb.cursors.DictCursor
-        conf["autocommit"] = True
-        _db = MySQLdb.connect(**conf)
-    return _db
-
-
-def db_initialize():
-    cur = db().cursor()
-    sqls = [
-        "DELETE FROM users WHERE id > 1000",
-        "DELETE FROM posts WHERE id > 10000",
-        "DELETE FROM comments WHERE id > 100000",
-        "UPDATE users SET del_flg = 0",
-        "UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
-    ]
-    for q in sqls:
-        cur.execute(q)
-    
-    # インデックスの作成（存在しない場合のみ）
-    index_sqls = [
-        "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts (user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments (post_id)",
-        "CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments (user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_users_del_flg ON users (del_flg)",
-        "CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts (user_id, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments (post_id, created_at DESC)",
-    ]
-    for q in index_sqls:
-        try:
-            cur.execute(q)
-        except Exception as e:
-            # インデックスが既に存在する場合などエラーを無視
-            pass
-
-
-_mcclient = None
-
-
-def memcache():
-    global _mcclient
-    if _mcclient is None:
-        conf = config()["memcache"]
-        _mcclient = MemcacheClient(
-            conf["address"], no_delay=True, default_noreply=False
+# Database connection
+async def get_db_pool():
+    global db_pool
+    if db_pool is None:
+        config = get_config()["db"]
+        db_pool = await aiomysql.create_pool(
+            host=config["host"],
+            port=config["port"],
+            user=config["user"],
+            password=config["password"],
+            db=config["db"],
+            charset="utf8mb4",
+            autocommit=True,
+            maxsize=20,
+            minsize=5,
         )
-    return _mcclient
+    return db_pool
 
+async def get_db():
+    pool = await get_db_pool()
+    return pool
 
-def try_login(account_name, password):
-    cur = db().cursor()
-    cur.execute(
-        "SELECT * FROM users WHERE account_name = %s AND del_flg = 0", (account_name,)
-    )
-    user = cur.fetchone()
+# Redis connection
+async def get_redis():
+    global redis_client
+    if redis_client is None:
+        config = get_config()["redis"]
+        redis_client = redis.Redis(
+            host=config["host"],
+            port=config["port"],
+            db=config["db"],
+            decode_responses=True
+        )
+    return redis_client
 
-    if user and calculate_passhash(user["account_name"], password) == user["passhash"]:
-        return user
-    return None
-
-
-def validate_user(account_name: str, password: str):
-    if not re.match(r"[0-9a-zA-Z]{3,}", account_name):
-        return False
-    if not re.match(r"[0-9a-zA-Z_]{6,}", password):
-        return False
-    return True
-
-
-def digest(src: str):
-    # opensslのバージョンによっては (stdin)= というのがつくので取る
+# Utility functions
+def digest(src: str) -> str:
+    """Calculate SHA512 digest using openssl"""
     out = subprocess.check_output(
         f"printf %s {shlex.quote(src)} | openssl dgst -sha512 | sed 's/^.*= //'",
         shell=True,
@@ -130,378 +149,30 @@ def digest(src: str):
     )
     return out.strip()
 
-
-def calculate_salt(account_name: str):
+def calculate_salt(account_name: str) -> str:
     return digest(account_name)
 
+def calculate_passhash(account_name: str, password: str) -> str:
+    return digest(f"{password}:{calculate_salt(account_name)}")
 
-def calculate_passhash(account_name: str, password: str):
-    return digest("%s:%s" % (password, calculate_salt(account_name)))
+def validate_user(account_name: str, password: str) -> bool:
+    if not re.match(r"[0-9a-zA-Z_]{3,}", account_name):
+        return False
+    if not re.match(r"[0-9a-zA-Z_]{6,}", password):
+        return False
+    return True
 
-
-def get_session_user():
-    user = flask.session.get("user")
-    if user:
-        cur = db().cursor()
-        cur.execute("SELECT * FROM `users` WHERE `id` = %s", (user["id"],))
-        return cur.fetchone()
-    return None
-
-
-def make_posts(results, all_comments=False):
-    if not results:
-        return []
-    
-    posts = []
-    cursor = db().cursor()
-    
-    # 投稿IDとユーザーIDを収集
-    post_ids = [post["id"] for post in results]
-    user_ids = list(set(post["user_id"] for post in results))
-    
-    # 一括でコメント数を取得
-    cursor.execute(
-        "SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN %s GROUP BY post_id",
-        (post_ids,)
-    )
-    comment_counts = {row["post_id"]: row["count"] for row in cursor.fetchall()}
-    
-    # 一括でコメントとユーザー情報を取得
-    if all_comments:
-        cursor.execute("""
-            SELECT c.*, u.id as comment_user_id, u.account_name as comment_user_account_name, 
-                   u.del_flg as comment_user_del_flg, u.authority as comment_user_authority,
-                   u.created_at as comment_user_created_at, u.passhash as comment_user_passhash
-            FROM comments c 
-            JOIN users u ON c.user_id = u.id 
-            WHERE c.post_id IN %s 
-            ORDER BY c.post_id, c.created_at DESC
-        """, (post_ids,))
-    else:
-        # サブクエリを使用して各投稿の最新3件のコメントのみ取得
-        cursor.execute("""
-            SELECT c.*, u.id as comment_user_id, u.account_name as comment_user_account_name, 
-                   u.del_flg as comment_user_del_flg, u.authority as comment_user_authority,
-                   u.created_at as comment_user_created_at, u.passhash as comment_user_passhash
-            FROM (
-                SELECT c1.*, ROW_NUMBER() OVER (PARTITION BY c1.post_id ORDER BY c1.created_at DESC) as rn
-                FROM comments c1
-                WHERE c1.post_id IN %s
-            ) c
-            JOIN users u ON c.user_id = u.id 
-            WHERE c.rn <= 3
-            ORDER BY c.post_id, c.created_at DESC
-        """, (post_ids,))
-    
-    # コメントデータを投稿ごとにグループ化
-    comments_by_post = {}
-    for row in cursor.fetchall():
-        post_id = row["post_id"]
-        if post_id not in comments_by_post:
-            comments_by_post[post_id] = []
-        
-        # コメントユーザー情報を構築
-        comment_user = {
-            "id": row["comment_user_id"],
-            "account_name": row["comment_user_account_name"],
-            "del_flg": row["comment_user_del_flg"],
-            "authority": row["comment_user_authority"],
-            "created_at": row["comment_user_created_at"],
-            "passhash": row["comment_user_passhash"]
-        }
-        
-        comment = {
-            "id": row["id"],
-            "post_id": row["post_id"],
-            "user_id": row["user_id"],
-            "comment": row["comment"],
-            "created_at": row["created_at"],
-            "user": comment_user
-        }
-        comments_by_post[post_id].append(comment)
-    
-    # 一括で投稿ユーザー情報を取得
-    cursor.execute("SELECT * FROM users WHERE id IN %s", (user_ids,))
-    users_by_id = {user["id"]: user for user in cursor.fetchall()}
-    
-    # データを組み立て
-    for post in results:
-        post["comment_count"] = comment_counts.get(post["id"], 0)
-        post_comments = comments_by_post.get(post["id"], [])
-        # コメントを古い順に並び替え（reverseと同じ効果）
-        post_comments.reverse()
-        post["comments"] = post_comments
-        post["user"] = users_by_id.get(post["user_id"])
-
-        if post["user"] and not post["user"]["del_flg"]:
-            posts.append(post)
-
-        if len(posts) >= POSTS_PER_PAGE:
-            break
-    
-    return posts
-
-
-# app setup
-static_path = pathlib.Path(__file__).resolve().parent.parent / "public"
-app = flask.Flask(__name__, static_folder=str(static_path), static_url_path="")
-# app.debug = True
-
-# Flask-Session
-app.config["SESSION_TYPE"] = "memcached"
-app.config["SESSION_MEMCACHED"] = memcache()
-Session(app)
-
-
-@app.template_global()
-def image_url(post):
+def image_url(post_id: int, mime: str) -> str:
     ext = ""
-    mime = post["mime"]
     if mime == "image/jpeg":
         ext = ".jpg"
     elif mime == "image/png":
         ext = ".png"
     elif mime == "image/gif":
         ext = ".gif"
+    return f"/image/{post_id}{ext}"
 
-    return "/image/%s%s" % (post["id"], ext)
-
-
-# http://flask.pocoo.org/snippets/28/
-_paragraph_re = re.compile(r"(?:\r\n|\r|\n){2,}")
-
-
-@app.template_filter()
-@pass_eval_context
-def nl2br(eval_ctx, value):
-    result = "\n\n".join(
-        "<p>%s</p>" % p.replace("\n", "<br>\n")
-        for p in _paragraph_re.split(escape(value))
-    )
-    if eval_ctx.autoescape:
-        result = Markup(result)
-    return result
-
-
-# endpoints
-
-
-@app.route("/initialize")
-def get_initialize():
-    db_initialize()
-    return ""
-
-
-@app.route("/login")
-def get_login():
-    if get_session_user():
-        return flask.redirect("/")
-    return flask.render_template("login.html", me=None)
-
-
-@app.route("/login", methods=["POST"])
-def post_login():
-    if get_session_user():
-        return flask.redirect("/")
-
-    user = try_login(flask.request.form["account_name"], flask.request.form["password"])
-    if user:
-        flask.session["user"] = {"id": user["id"]}
-        flask.session["csrf_token"] = os.urandom(8).hex()
-        return flask.redirect("/")
-
-    flask.flash("アカウント名かパスワードが間違っています")
-    return flask.redirect("/login")
-
-
-@app.route("/register")
-def get_register():
-    if get_session_user():
-        return flask.redirect("/")
-    return flask.render_template("register.html", me=None)
-
-
-@app.route("/register", methods=["POST"])
-def post_register():
-    if get_session_user():
-        return flask.redirect("/")
-
-    account_name = flask.request.form["account_name"]
-    password = flask.request.form["password"]
-    if not validate_user(account_name, password):
-        flask.flash(
-            "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
-        )
-        return flask.redirect("/register")
-
-    cursor = db().cursor()
-    cursor.execute("SELECT 1 FROM users WHERE `account_name` = %s", (account_name,))
-    user = cursor.fetchone()
-    if user:
-        flask.flash("アカウント名がすでに使われています")
-        return flask.redirect("/register")
-
-    query = "INSERT INTO `users` (`account_name`, `passhash`) VALUES (%s, %s)"
-    cursor.execute(query, (account_name, calculate_passhash(account_name, password)))
-
-    flask.session["user"] = {"id": cursor.lastrowid}
-    flask.session["csrf_token"] = os.urandom(8).hex()
-    return flask.redirect("/")
-
-
-@app.route("/logout")
-def get_logout():
-    flask.session.clear()
-    return flask.redirect("/")
-
-
-@app.route("/")
-def get_index():
-    me = get_session_user()
-
-    cursor = db().cursor()
-    cursor.execute(
-        "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC LIMIT %s",
-        (POSTS_PER_PAGE * 2,)  # 余裕を持ってフィルタリング後に十分な数を確保
-    )
-    posts = make_posts(cursor.fetchall())
-
-    return flask.render_template("index.html", posts=posts, me=me)
-
-
-@app.route("/@<account_name>")
-def get_user_list(account_name):
-    cursor = db().cursor()
-
-    cursor.execute(
-        "SELECT * FROM `users` WHERE `account_name` = %s AND `del_flg` = 0",
-        (account_name,),
-    )
-    user = cursor.fetchone()
-    if user is None:
-        flask.abort(404)  # raises exception
-
-    cursor.execute(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = %s ORDER BY `created_at` DESC",
-        (user["id"],),
-    )
-    posts = make_posts(cursor.fetchall())
-
-    cursor.execute(
-        "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = %s", (user["id"],)
-    )
-    comment_count = cursor.fetchone()["count"]
-
-    cursor.execute("SELECT `id` FROM `posts` WHERE `user_id` = %s", (user["id"],))
-    post_ids = [p["id"] for p in cursor]
-    post_count = len(post_ids)
-
-    commented_count = 0
-    if post_count > 0:
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN %s",
-            (post_ids,),
-        )
-        commented_count = cursor.fetchone()["count"]
-
-    me = get_session_user()
-
-    return flask.render_template(
-        "user.html",
-        posts=posts,
-        user=user,
-        post_count=post_count,
-        comment_count=comment_count,
-        commented_count=commented_count,
-        me=me,
-    )
-
-
-def _parse_iso8601(s):
-    # http://bugs.python.org/issue15873
-    # Ignore timezone
-    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[ tT](\d{2}):(\d{2}):(\d{2}).*", s)
-    if not m:
-        raise ValueError("Invlaid iso8601 format: %r" % (s,))
-    return datetime.datetime(*map(int, m.groups()))
-
-
-@app.route("/posts")
-def get_posts():
-    cursor = db().cursor()
-    max_created_at = flask.request.args["max_created_at"] or None
-    if max_created_at:
-        max_created_at = _parse_iso8601(max_created_at)
-        cursor.execute(
-            "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= %s ORDER BY `created_at` DESC",
-            (max_created_at,),
-        )
-    else:
-        cursor.execute(
-            "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT %s",
-            (POSTS_PER_PAGE * 2,)
-        )
-    results = cursor.fetchall()
-    posts = make_posts(results)
-    return flask.render_template("posts.html", posts=posts)
-
-
-@app.route("/posts/<id>")
-def get_posts_id(id):
-    cursor = db().cursor()
-
-    cursor.execute("SELECT * FROM `posts` WHERE `id` = %s", (id,))
-    posts = make_posts(cursor.fetchall(), all_comments=True)
-    if not posts:
-        flask.abort(404)
-
-    me = get_session_user()
-    return flask.render_template("post.html", post=posts[0], me=me)
-
-
-@app.route("/", methods=["POST"])
-def post_index():
-    me = get_session_user()
-    if not me:
-        return flask.redirect("/login")
-
-    if flask.request.form["csrf_token"] != flask.session["csrf_token"]:
-        flask.abort(422)
-
-    file = flask.request.files.get("file")
-    if not file:
-        flask.flash("画像が必要です")
-        return flask.redirect("/")
-
-    # 投稿のContent-Typeからファイルのタイプを決定する
-    mime = file.mimetype
-    if mime not in ("image/jpeg", "image/png", "image/gif"):
-        flask.flash("投稿できる画像形式はjpgとpngとgifだけです")
-        return flask.redirect("/")
-
-    with tempfile.TemporaryFile() as tempf:
-        file.save(tempf)
-        tempf.flush()
-
-        if tempf.tell() > UPLOAD_LIMIT:
-            flask.flash("ファイルサイズが大きすぎます")
-            return flask.redirect("/")
-
-        tempf.seek(0)
-        imgdata = tempf.read()
-
-    query = "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (%s,%s,%s,%s)"
-    cursor = db().cursor()
-    cursor.execute(query, (me["id"], mime, imgdata, flask.request.form.get("body")))
-    pid = cursor.lastrowid
-    
-    # 画像をファイルシステムにも保存
-    save_image_to_file(pid, imgdata, mime)
-    
-    return flask.redirect("/posts/%d" % pid)
-
-
-def save_image_to_file(post_id, imgdata, mime):
+async def save_image_to_file(post_id: int, imgdata: bytes, mime: str):
     """画像をファイルシステムに保存"""
     ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}
     ext = ext_map.get(mime)
@@ -511,110 +182,666 @@ def save_image_to_file(post_id, imgdata, mime):
     # ディレクトリが存在しない場合は作成
     os.makedirs(IMAGE_STORAGE_DIR, exist_ok=True)
     
-    filename = f"{post_id}.{ext}"
-    filepath = os.path.join(IMAGE_STORAGE_DIR, filename)
-    
-    try:
-        with open(filepath, "wb") as f:
-            f.write(imgdata)
-        return filename
-    except Exception as e:
-        flask.current_app.logger.error(f"Failed to save image {filename}: {e}")
+    file_path = f"{IMAGE_STORAGE_DIR}/{post_id}.{ext}"
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(imgdata)
+    return file_path
+
+# Session management (simplified - using Redis)
+async def get_session_user(request: Request) -> Optional[Dict[str, Any]]:
+    session_id = request.cookies.get("session_id")
+    if not session_id:
         return None
-
-@app.route("/image/<id>.<ext>")
-def get_image(id, ext):
-    if not id:
-        return ""
-    id = int(id)
-    if id == 0:
-        return ""
-
-    # まずファイルシステムから画像を探す
-    filepath = os.path.join(IMAGE_STORAGE_DIR, f"{id}.{ext}")
-    if os.path.exists(filepath):
-        mime_map = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif"}
-        mime = mime_map.get(ext)
-        if mime:
-            return flask.send_file(filepath, mimetype=mime)
-
-    # ファイルが存在しない場合、データベースから取得してファイルに保存
-    cursor = db().cursor()
-    cursor.execute("SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = %s", (id,))
-    post = cursor.fetchone()
     
-    if not post:
-        flask.abort(404)
-
-    mime = post["mime"]
-    ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}
-    expected_ext = ext_map.get(mime)
+    redis_conn = await get_redis()
+    user_data = await redis_conn.hgetall(f"session:{session_id}")
+    if not user_data:
+        return None
     
-    if ext != expected_ext:
-        flask.abort(404)
-    
-    # ファイルに保存
-    save_image_to_file(id, post["imgdata"], mime)
-    
-    return flask.Response(post["imgdata"], mimetype=mime)
+    # Get user from database
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT * FROM users WHERE id = %s", (user_data["user_id"],))
+            return await cursor.fetchone()
 
+async def create_session(user_id: int) -> str:
+    """Create a new session"""
+    import secrets
+    session_id = secrets.token_urlsafe(32)
+    
+    redis_conn = await get_redis()
+    await redis_conn.hset(f"session:{session_id}", mapping={
+        "user_id": user_id,
+        "csrf_token": secrets.token_urlsafe(16)
+    })
+    await redis_conn.expire(f"session:{session_id}", 3600 * 24)  # 24 hours
+    
+    return session_id
 
-@app.route("/comment", methods=["POST"])
-def post_comment():
-    me = get_session_user()
+# Database operations with caching
+async def try_login(account_name: str, password: str) -> Optional[Dict[str, Any]]:
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(
+                "SELECT * FROM users WHERE account_name = %s AND del_flg = 0",
+                (account_name,)
+            )
+            user = await cursor.fetchone()
+            
+            if user and calculate_passhash(user["account_name"], password) == user["passhash"]:
+                return user
+            return None
+
+async def get_posts_with_cache(limit: int = POSTS_PER_PAGE * 2) -> List[Dict[str, Any]]:
+    """投稿一覧を取得（キャッシュ付き）"""
+    redis_conn = await get_redis()
+    cache_key = f"posts:latest:{limit}"
+    
+    # キャッシュから取得を試行
+    cached_posts = await redis_conn.get(cache_key)
+    if cached_posts:
+        import json
+        return json.loads(cached_posts)
+    
+    # DBから取得
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(
+                "SELECT id, user_id, body, created_at, mime FROM posts ORDER BY created_at DESC LIMIT %s",
+                (limit,)
+            )
+            posts = await cursor.fetchall()
+            
+            # Convert datetime to string for JSON serialization
+            for post in posts:
+                post["created_at"] = post["created_at"].isoformat()
+            
+            # キャッシュに保存（60秒TTL）
+            import json
+            await redis_conn.setex(cache_key, 60, json.dumps(posts, default=str))
+            
+            return posts
+
+async def make_posts_optimized(results: List[Dict[str, Any]], all_comments: bool = False) -> List[Dict[str, Any]]:
+    """最適化された投稿データ作成"""
+    if not results:
+        return []
+    
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            post_ids = [post["id"] for post in results]
+            user_ids = list(set(post["user_id"] for post in results))
+            
+            # 一括でコメント数を取得
+            await cursor.execute(
+                "SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN %s GROUP BY post_id",
+                (post_ids,)
+            )
+            comment_counts = {row["post_id"]: row["count"] for row in await cursor.fetchall()}
+            
+            # 一括でコメントを取得
+            if all_comments:
+                await cursor.execute("""
+                    SELECT c.*, u.id as comment_user_id, u.account_name as comment_user_account_name, 
+                           u.del_flg as comment_user_del_flg, u.authority as comment_user_authority,
+                           u.created_at as comment_user_created_at, u.passhash as comment_user_passhash
+                    FROM comments c 
+                    JOIN users u ON c.user_id = u.id 
+                    WHERE c.post_id IN %s 
+                    ORDER BY c.post_id, c.created_at DESC
+                """, (post_ids,))
+            else:
+                await cursor.execute("""
+                    SELECT c.*, u.id as comment_user_id, u.account_name as comment_user_account_name, 
+                           u.del_flg as comment_user_del_flg, u.authority as comment_user_authority,
+                           u.created_at as comment_user_created_at, u.passhash as comment_user_passhash
+                    FROM (
+                        SELECT c1.*, ROW_NUMBER() OVER (PARTITION BY c1.post_id ORDER BY c1.created_at DESC) as rn
+                        FROM comments c1
+                        WHERE c1.post_id IN %s
+                    ) c
+                    JOIN users u ON c.user_id = u.id 
+                    WHERE c.rn <= 3
+                    ORDER BY c.post_id, c.created_at DESC
+                """, (post_ids,))
+            
+            # コメントデータをグループ化
+            comments_by_post = {}
+            for row in await cursor.fetchall():
+                post_id = row["post_id"]
+                if post_id not in comments_by_post:
+                    comments_by_post[post_id] = []
+                
+                comment_user = {
+                    "id": row["comment_user_id"],
+                    "account_name": row["comment_user_account_name"],
+                    "del_flg": row["comment_user_del_flg"],
+                    "authority": row["comment_user_authority"],
+                    "created_at": row["comment_user_created_at"],
+                    "passhash": row["comment_user_passhash"]
+                }
+                
+                comment = {
+                    "id": row["id"],
+                    "post_id": row["post_id"],
+                    "user_id": row["user_id"],
+                    "comment": row["comment"],
+                    "created_at": row["created_at"],
+                    "user": comment_user
+                }
+                comments_by_post[post_id].append(comment)
+            
+            # 一括でユーザー情報を取得
+            await cursor.execute("SELECT * FROM users WHERE id IN %s", (user_ids,))
+            users_by_id = {user["id"]: user for user in await cursor.fetchall()}
+            
+            # データを組み立て
+            posts = []
+            for post in results:
+                # Convert datetime string back to datetime if needed
+                if isinstance(post["created_at"], str):
+                    post["created_at"] = datetime.datetime.fromisoformat(post["created_at"])
+                
+                post["comment_count"] = comment_counts.get(post["id"], 0)
+                post_comments = comments_by_post.get(post["id"], [])
+                post_comments.reverse()  # 古い順に並び替え
+                post["comments"] = post_comments
+                post["user"] = users_by_id.get(post["user_id"])
+                
+                if post["user"] and not post["user"]["del_flg"]:
+                    posts.append(post)
+                
+                if len(posts) >= POSTS_PER_PAGE:
+                    break
+            
+            return posts
+
+# 追加エンドポイントとキャッシュ戦略
+
+async def get_user_with_cache(account_name: str) -> Optional[Dict[str, Any]]:
+    """ユーザー情報をキャッシュ付きで取得"""
+    redis_conn = await get_redis()
+    cache_key = f"user:{account_name}"
+    
+    # キャッシュから取得を試行
+    cached_user = await redis_conn.get(cache_key)
+    if cached_user:
+        import json
+        return json.loads(cached_user)
+    
+    # DBから取得
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(
+                "SELECT * FROM users WHERE account_name = %s AND del_flg = 0",
+                (account_name,)
+            )
+            user = await cursor.fetchone()
+            
+            if user:
+                # Convert datetime to string for JSON serialization
+                user["created_at"] = user["created_at"].isoformat()
+                
+                # キャッシュに保存（300秒TTL）
+                import json
+                await redis_conn.setex(cache_key, 300, json.dumps(user, default=str))
+            
+            return user
+
+async def invalidate_cache_on_post_create():
+    """投稿作成時のキャッシュ無効化"""
+    redis_conn = await get_redis()
+    # 投稿一覧のキャッシュを削除
+    await redis_conn.delete(f"posts:latest:{POSTS_PER_PAGE * 2}")
+
+async def invalidate_cache_on_comment_create(post_id: int):
+    """コメント作成時のキャッシュ無効化"""
+    redis_conn = await get_redis()
+    # 投稿詳細のキャッシュを削除
+    await redis_conn.delete(f"post:{post_id}")
+    # 投稿一覧のキャッシュも削除（コメント数が変わるため）
+    await redis_conn.delete(f"posts:latest:{POSTS_PER_PAGE * 2}")
+
+# API Endpoints
+
+@app.get("/initialize")
+async def initialize():
+    """データベース初期化"""
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            sqls = [
+                "DELETE FROM users WHERE id > 1000",
+                "DELETE FROM posts WHERE id > 10000", 
+                "DELETE FROM comments WHERE id > 100000",
+                "UPDATE users SET del_flg = 0",
+                "UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
+            ]
+            for sql in sqls:
+                await cursor.execute(sql)
+            
+            # インデックス作成
+            index_sqls = [
+                "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts (user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments (post_id)",
+                "CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments (user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_users_del_flg ON users (del_flg)",
+                "CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts (user_id, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments (post_id, created_at DESC)",
+            ]
+            for sql in index_sqls:
+                try:
+                    await cursor.execute(sql)
+                except Exception:
+                    pass  # インデックスが既に存在する場合は無視
+    
+    # キャッシュクリア
+    redis_conn = await get_redis()
+    await redis_conn.flushdb()
+    
+    return ""
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index(request: Request):
+    """メインページ"""
+    me = await get_session_user(request)
+    posts_data = await get_posts_with_cache()
+    posts = await make_posts_optimized(posts_data)
+    
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "posts": posts,
+        "me": me
+    })
+
+@app.get("/login", response_class=HTMLResponse)
+async def get_login(request: Request):
+    """ログインページ"""
+    if await get_session_user(request):
+        return RedirectResponse(url="/", status_code=302)
+    
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "me": None
+    })
+
+@app.post("/login")
+async def post_login(
+    request: Request,
+    account_name: str = Form(...),
+    password: str = Form(...)
+):
+    """ログイン処理"""
+    if await get_session_user(request):
+        return RedirectResponse(url="/", status_code=302)
+    
+    user = await try_login(account_name, password)
+    if user:
+        session_id = await create_session(user["id"])
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie("session_id", session_id, httponly=True, max_age=86400)
+        return response
+    
+    return RedirectResponse(url="/login?error=1", status_code=302)
+
+@app.get("/register", response_class=HTMLResponse)
+async def get_register(request: Request):
+    """登録ページ"""
+    if await get_session_user(request):
+        return RedirectResponse(url="/", status_code=302)
+    
+    return templates.TemplateResponse("register.html", {
+        "request": request,
+        "me": None
+    })
+
+@app.post("/register")
+async def post_register(
+    request: Request,
+    account_name: str = Form(...),
+    password: str = Form(...)
+):
+    """ユーザー登録"""
+    if await get_session_user(request):
+        return RedirectResponse(url="/", status_code=302)
+    
+    if not validate_user(account_name, password):
+        return RedirectResponse(url="/register?error=validation", status_code=302)
+    
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # 既存ユーザーチェック
+            await cursor.execute("SELECT 1 FROM users WHERE account_name = %s", (account_name,))
+            if await cursor.fetchone():
+                return RedirectResponse(url="/register?error=exists", status_code=302)
+            
+            # ユーザー作成
+            await cursor.execute(
+                "INSERT INTO users (account_name, passhash) VALUES (%s, %s)",
+                (account_name, calculate_passhash(account_name, password))
+            )
+            user_id = conn.insert_id()
+            
+            # セッション作成
+            session_id = await create_session(user_id)
+            response = RedirectResponse(url="/", status_code=302)
+            response.set_cookie("session_id", session_id, httponly=True, max_age=86400)
+            return response
+
+@app.get("/logout")
+async def get_logout(request: Request):
+    """ログアウト"""
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        redis_conn = await get_redis()
+        await redis_conn.delete(f"session:{session_id}")
+    
+    response = RedirectResponse(url="/", status_code=302)
+    response.delete_cookie("session_id")
+    return response
+
+@app.get("/image/{post_id}.{ext}")
+async def get_image(post_id: int, ext: str):
+    """画像配信（最適化版）"""
+    # まずファイルシステムから配信を試行
+    file_path = f"{IMAGE_STORAGE_DIR}/{post_id}.{ext}"
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    
+    # ファイルが存在しない場合はDBから取得
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT * FROM posts WHERE id = %s", (post_id,))
+            post = await cursor.fetchone()
+            
+            if not post:
+                raise HTTPException(status_code=404, detail="Post not found")
+            
+            # MIMEタイプチェック
+            mime_ext_map = {
+                "image/jpeg": "jpg",
+                "image/png": "png", 
+                "image/gif": "gif"
+            }
+            
+            if ext not in mime_ext_map.values() or mime_ext_map.get(post["mime"]) != ext:
+                raise HTTPException(status_code=404, detail="Invalid image format")
+            
+            # ファイルシステムに保存（次回用）
+            await save_image_to_file(post_id, post["imgdata"], post["mime"])
+            
+            # レスポンス返却
+            return Response(content=post["imgdata"], media_type=post["mime"])
+
+@app.get("/@{account_name}", response_class=HTMLResponse)
+async def get_user_profile(request: Request, account_name: str):
+    """ユーザープロフィールページ"""
+    me = await get_session_user(request)
+    
+    user = await get_user_with_cache(account_name)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Convert datetime string back to datetime if needed
+    if isinstance(user["created_at"], str):
+        user["created_at"] = datetime.datetime.fromisoformat(user["created_at"])
+    
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # ユーザーの投稿を取得
+            await cursor.execute(
+                "SELECT id, user_id, body, mime, created_at FROM posts WHERE user_id = %s ORDER BY created_at DESC",
+                (user["id"],)
+            )
+            posts_data = await cursor.fetchall()
+            posts = await make_posts_optimized(posts_data)
+            
+            # 統計情報を取得
+            await cursor.execute(
+                "SELECT COUNT(*) AS count FROM comments WHERE user_id = %s",
+                (user["id"],)
+            )
+            comment_count = (await cursor.fetchone())["count"]
+            
+            await cursor.execute(
+                "SELECT id FROM posts WHERE user_id = %s",
+                (user["id"],)
+            )
+            post_ids = [p["id"] for p in await cursor.fetchall()]
+            post_count = len(post_ids)
+            
+            commented_count = 0
+            if post_count > 0:
+                await cursor.execute(
+                    "SELECT COUNT(*) AS count FROM comments WHERE post_id IN %s",
+                    (post_ids,)
+                )
+                commented_count = (await cursor.fetchone())["count"]
+    
+    return templates.TemplateResponse("user.html", {
+        "request": request,
+        "posts": posts,
+        "user": user,
+        "post_count": post_count,
+        "comment_count": comment_count,
+        "commented_count": commented_count,
+        "me": me
+    })
+
+@app.get("/posts", response_class=HTMLResponse)
+async def get_posts(request: Request, max_created_at: Optional[str] = None):
+    """投稿一覧ページ（ページング対応）"""
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            if max_created_at:
+                # datetime文字列をパース
+                import re
+                m = re.match(r"(\d{4})-(\d{2})-(\d{2})[ tT](\d{2}):(\d{2}):(\d{2}).*", max_created_at)
+                if m:
+                    max_dt = datetime.datetime(*map(int, m.groups()))
+                    await cursor.execute(
+                        "SELECT id, user_id, body, mime, created_at FROM posts WHERE created_at <= %s ORDER BY created_at DESC LIMIT %s",
+                        (max_dt, POSTS_PER_PAGE * 2)
+                    )
+                else:
+                    await cursor.execute(
+                        "SELECT id, user_id, body, mime, created_at FROM posts ORDER BY created_at DESC LIMIT %s",
+                        (POSTS_PER_PAGE * 2,)
+                    )
+            else:
+                await cursor.execute(
+                    "SELECT id, user_id, body, mime, created_at FROM posts ORDER BY created_at DESC LIMIT %s",
+                    (POSTS_PER_PAGE * 2,)
+                )
+            
+            posts_data = await cursor.fetchall()
+            posts = await make_posts_optimized(posts_data)
+    
+    return templates.TemplateResponse("posts.html", {
+        "request": request,
+        "posts": posts
+    })
+
+@app.get("/posts/{post_id}", response_class=HTMLResponse)
+async def get_post_detail(request: Request, post_id: int):
+    """投稿詳細ページ"""
+    me = await get_session_user(request)
+    
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT * FROM posts WHERE id = %s", (post_id,))
+            post_data = await cursor.fetchall()
+            
+            if not post_data:
+                raise HTTPException(status_code=404, detail="Post not found")
+            
+            posts = await make_posts_optimized(post_data, all_comments=True)
+            if not posts:
+                raise HTTPException(status_code=404, detail="Post not found")
+    
+    return templates.TemplateResponse("post.html", {
+        "request": request,
+        "post": posts[0],
+        "me": me
+    })
+
+@app.post("/")
+async def create_post(
+    request: Request,
+    csrf_token: str = Form(...),
+    body: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """投稿作成"""
+    me = await get_session_user(request)
     if not me:
-        return flask.redirect("/login")
+        return RedirectResponse(url="/login", status_code=302)
+    
+    # CSRF トークン検証（簡易版）
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        redis_conn = await get_redis()
+        session_data = await redis_conn.hgetall(f"session:{session_id}")
+        if session_data.get("csrf_token") != csrf_token:
+            raise HTTPException(status_code=422, detail="Invalid CSRF token")
+    
+    # ファイル検証
+    if not file or file.filename == "":
+        return RedirectResponse(url="/?error=no_file", status_code=302)
+    
+    # MIMEタイプ検証
+    if file.content_type not in ("image/jpeg", "image/png", "image/gif"):
+        return RedirectResponse(url="/?error=invalid_format", status_code=302)
+    
+    # ファイルサイズ検証
+    file_content = await file.read()
+    if len(file_content) > UPLOAD_LIMIT:
+        return RedirectResponse(url="/?error=file_too_large", status_code=302)
+    
+    # DBに保存
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO posts (user_id, mime, imgdata, body) VALUES (%s, %s, %s, %s)",
+                (me["id"], file.content_type, file_content, body)
+            )
+            post_id = conn.insert_id()
+            
+            # ファイルシステムにも保存
+            await save_image_to_file(post_id, file_content, file.content_type)
+            
+            # キャッシュ無効化
+            await invalidate_cache_on_post_create()
+    
+    return RedirectResponse(url=f"/posts/{post_id}", status_code=302)
 
-    if flask.request.form["csrf_token"] != flask.session["csrf_token"]:
-        flask.abort(422)
-
-    post_id = flask.request.form["post_id"]
-    if not re.match(r"[0-9]+", post_id):
-        return "post_idは整数のみです"
-    post_id = int(post_id)
-
-    query = (
-        "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (%s, %s, %s)"
-    )
-    cursor = db().cursor()
-    cursor.execute(query, (post_id, me["id"], flask.request.form["comment"]))
-
-    return flask.redirect("/posts/%d" % post_id)
-
-
-@app.route("/admin/banned")
-def get_banned():
-    me = get_session_user()
+@app.post("/comment")
+async def create_comment(
+    request: Request,
+    csrf_token: str = Form(...),
+    post_id: int = Form(...),
+    comment: str = Form(...)
+):
+    """コメント作成"""
+    me = await get_session_user(request)
     if not me:
-        flask.redirect("/login")
+        return RedirectResponse(url="/login", status_code=302)
+    
+    # CSRF トークン検証
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        redis_conn = await get_redis()
+        session_data = await redis_conn.hgetall(f"session:{session_id}")
+        if session_data.get("csrf_token") != csrf_token:
+            raise HTTPException(status_code=422, detail="Invalid CSRF token")
+    
+    # コメント保存
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO comments (post_id, user_id, comment) VALUES (%s, %s, %s)",
+                (post_id, me["id"], comment)
+            )
+            
+            # キャッシュ無効化
+            await invalidate_cache_on_comment_create(post_id)
+    
+    return RedirectResponse(url=f"/posts/{post_id}", status_code=302)
 
-    if me["authority"] == 0:
-        flask.abort(403)
+@app.get("/admin/banned", response_class=HTMLResponse)
+async def get_banned(request: Request):
+    """BANページ"""
+    me = await get_session_user(request)
+    
+    return templates.TemplateResponse("banned.html", {
+        "request": request,
+        "me": me
+    })
 
-    cursor = db().cursor()
-    cursor.execute(
-        "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC"
-    )
-    users = cursor.fetchall()
+@app.post("/admin/banned")
+async def post_banned(
+    request: Request,
+    csrf_token: str = Form(...),
+    uid: int = Form(...)
+):
+    """ユーザーBAN"""
+    me = await get_session_user(request)
+    if not me or me.get("authority") != 1:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    # CSRF トークン検証
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        redis_conn = await get_redis()
+        session_data = await redis_conn.hgetall(f"session:{session_id}")
+        if session_data.get("csrf_token") != csrf_token:
+            raise HTTPException(status_code=422, detail="Invalid CSRF token")
+    
+    # ユーザーを削除フラグ設定
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("UPDATE users SET del_flg = 1 WHERE id = %s", (uid,))
+            
+            # ユーザーキャッシュを無効化
+            await cursor.execute("SELECT account_name FROM users WHERE id = %s", (uid,))
+            user = await cursor.fetchone()
+            if user:
+                redis_conn = await get_redis()
+                await redis_conn.delete(f"user:{user['account_name']}")
+    
+    return RedirectResponse(url="/admin/banned", status_code=302)
 
-    flask.render_template("banned.html", users=users, me=me)
+# Health check
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "version": "2.0.0"}
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """アプリケーション起動時の初期化"""
+    # Database pool initialization
+    await get_db_pool()
+    
+    # Redis initialization
+    await get_redis()
+    
+    # 画像保存ディレクトリ作成
+    os.makedirs(IMAGE_STORAGE_DIR, exist_ok=True)
 
-@app.route("/admin/banned", methods=["POST"])
-def post_banned():
-    me = get_session_user()
-    if not me:
-        flask.redirect("/login")
-
-    if me["authority"] == 0:
-        flask.abort(403)
-
-    if flask.request.form["csrf_token"] != flask.session["csrf_token"]:
-        flask.abort(422)
-
-    cursor = db().cursor()
-    query = "UPDATE `users` SET `del_flg` = %s WHERE `id` = %s"
-    for id in flask.request.form.getlist("uid", type=int):
-        cursor.execute(query, (1, id))
-
-    return flask.redirect("/admin/banned")
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)

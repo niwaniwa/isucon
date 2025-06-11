@@ -15,11 +15,12 @@ services:
   app:
     build:
       # Go実装の場合は golang/ PHP実装の場合は php/ Python実装の場合は python/ に変更
-      context: ruby/
+      context: python/
       dockerfile: Dockerfile
     depends_on:
       - mysql
       - memcached
+      - redis
     environment:
       ISUCONP_DB_HOST: mysql
       ISUCONP_DB_PORT: 3306
@@ -27,10 +28,14 @@ services:
       ISUCONP_DB_PASSWORD: root
       ISUCONP_DB_NAME: isuconp
       ISUCONP_MEMCACHED_ADDRESS: memcached:11211
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
     networks:
       - my_network
     volumes:
       - ./public:/home/public
+      - /var/www/images:/var/www/images
     init: true
     deploy:
       resources:
@@ -62,8 +67,21 @@ services:
     networks:
       - my_network
 
+  redis:
+    image: redis:7.4-alpine
+    networks:
+      - my_network
+    volumes:
+      - redis:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+
 volumes:
   mysql:
+  redis:
 
 networks:
   my_network:
