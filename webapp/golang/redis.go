@@ -106,26 +106,15 @@ func setPostsCache(key string, posts []Post, expiration time.Duration) error {
 
 // InvalidatePostsCaches invalidates all posts-related caches
 func invalidatePostsCaches() error {
-	// Pattern to match all posts caches
-	patterns := []string{
-		"posts:index:*",
-		"posts:user:*",
-		"posts:*",
-	}
+	// Just invalidate the main index cache
+	// User-specific caches will expire naturally
+	return redisClient.Del(ctx, "posts:index:latest").Err()
+}
 
-	for _, pattern := range patterns {
-		iter := redisClient.Scan(ctx, 0, pattern, 0).Iterator()
-		for iter.Next(ctx) {
-			if err := redisClient.Del(ctx, iter.Val()).Err(); err != nil {
-				return err
-			}
-		}
-		if err := iter.Err(); err != nil {
-			return err
-		}
-	}
-
-	return nil
+// InvalidateUserPostsCache invalidates posts cache for a specific user
+func invalidateUserPostsCache(userID int) error {
+	key := fmt.Sprintf("posts:user:%d", userID)
+	return redisClient.Del(ctx, key).Err()
 }
 
 // GetCommentCountFromCache gets comment count from Redis cache

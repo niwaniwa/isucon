@@ -246,16 +246,10 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		}
 		
 		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
-	return posts, nil
+	return posts, nil 
 }
 
 func imageURL(p Post) string {
@@ -440,8 +434,15 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	if posts == nil {
 		results := []Post{}
-		// Limit the initial query to avoid loading too many posts
-		err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*2)
+		// Get posts from active users only
+		err := db.Select(&results, `
+			SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+			FROM posts p
+			JOIN users u ON p.user_id = u.id
+			WHERE u.del_flg = 0
+			ORDER BY p.created_at DESC 
+			LIMIT ?
+		`, postsPerPage)
 		if err != nil {
 			log.Print(err)
 			return
@@ -495,19 +496,35 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-
-	// Limit posts per user page
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage*2)
-	if err != nil {
-		log.Print(err)
-		return
+	// Try cache first for user posts
+	cacheKey := fmt.Sprintf("posts:user:%d", user.ID)
+	var posts []Post
+	if redisClient != nil {
+		cachedPosts, err := getPostsFromCache(cacheKey)
+		if err == nil && cachedPosts != nil {
+			posts = cachedPosts
+		}
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
+	if posts == nil {
+		results := []Post{}
+		// Get posts for specific user
+		err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		posts, err = makePosts(results, getCSRFToken(r), false)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// Cache for 1 minute
+		if redisClient != nil && len(posts) > 0 {
+			setPostsCache(cacheKey, posts, 1*time.Minute)
+		}
 	}
 
 	commentCount := 0
@@ -590,8 +607,15 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	// Add LIMIT to avoid loading too many posts
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*2)
+	// Get posts before specified time from active users
+	err = db.Select(&results, `
+		SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+		FROM posts p
+		JOIN users u ON p.user_id = u.id
+		WHERE p.created_at <= ? AND u.del_flg = 0
+		ORDER BY p.created_at DESC 
+		LIMIT ?
+	`, t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -759,9 +783,10 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Invalidate posts caches
+	// Invalidate caches
 	if redisClient != nil {
 		invalidatePostsCaches()
+		invalidateUserPostsCache(me.ID)
 	}
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
