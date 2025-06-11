@@ -194,7 +194,7 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
-	
+
 	// Collect all post IDs and user IDs
 	postIDs := make([]int, 0, len(results))
 	userIDs := make([]int, 0, len(results))
@@ -202,19 +202,19 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		postIDs = append(postIDs, p.ID)
 		userIDs = append(userIDs, p.UserID)
 	}
-	
+
 	// Batch get all users
 	userMap, err := batchGetUsers(userIDs)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Batch get comment counts
 	commentCounts, err := getCommentCounts(postIDs)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Batch get comments
 	limit := 0
 	if !allComments {
@@ -228,7 +228,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	for _, p := range results {
 		// Set comment count
 		p.CommentCount = commentCounts[p.ID]
-		
+
 		// Set comments
 		if comments, ok := commentsMap[p.ID]; ok {
 			// reverse for chronological order
@@ -239,12 +239,12 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		} else {
 			p.Comments = []Comment{}
 		}
-		
+
 		// Set user
 		if user, ok := userMap[p.UserID]; ok {
 			p.User = *user
 		}
-		
+
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
@@ -431,7 +431,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	results := []Post{}
 
 	// Limit the initial query to avoid loading too many posts
-	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
+	err := db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
@@ -568,7 +568,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := time.Parse(ISO8601Format, maxCreatedAt)
+	_, err = time.Parse(ISO8601Format, maxCreatedAt)
 	if err != nil {
 		log.Print(err)
 		return
@@ -618,7 +618,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 	// Select only needed columns
-	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 
 	if err != nil {
 		log.Print(err)
@@ -734,7 +734,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	
+
 	// Save image to filesystem
 	err = saveImageToFile(int(pid), mime, filedata)
 	if err != nil {
@@ -758,7 +758,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ext := chi.URLParam(r, "ext")
-	
+
 	// First try to load from filesystem
 	imgdata, err := loadImageFromFile(pid, ext)
 	if err == nil {
@@ -798,7 +798,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		ext == "gif" && post.Mime == "image/gif" {
 		// Save to filesystem for next time
 		go copyImageData(post.ID, post.Mime, post.Imgdata)
-		
+
 		w.Header().Set("Content-Type", post.Mime)
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		_, err := w.Write(post.Imgdata)
@@ -942,17 +942,17 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
-	
+
 	// Configure connection pool
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
-	
+
 	// Initialize image directory
 	if err := initImageDir(); err != nil {
 		log.Fatalf("Failed to initialize image directory: %s", err.Error())
 	}
-	
+
 	// Initialize Redis
 	if err := initRedis(); err != nil {
 		log.Printf("Failed to initialize Redis (will continue without cache): %s", err.Error())
