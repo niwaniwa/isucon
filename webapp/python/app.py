@@ -16,6 +16,8 @@ from pymemcache.client.base import Client as MemcacheClient
 UPLOAD_LIMIT = 10 * 1024 * 1024  # 10mb
 POSTS_PER_PAGE = 20
 
+# 画像保存用ディレクトリ
+IMAGE_STORAGE_DIR = "/var/www/images"
 
 _config = None
 
@@ -67,6 +69,23 @@ def db_initialize():
     ]
     for q in sqls:
         cur.execute(q)
+    
+    # インデックスの作成（存在しない場合のみ）
+    index_sqls = [
+        "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts (user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments (post_id)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments (user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_users_del_flg ON users (del_flg)",
+        "CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts (user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments (post_id, created_at DESC)",
+    ]
+    for q in index_sqls:
+        try:
+            cur.execute(q)
+        except Exception as e:
+            # インデックスが既に存在する場合などエラーを無視
+            pass
 
 
 _mcclient = None
@@ -130,40 +149,96 @@ def get_session_user():
 
 
 def make_posts(results, all_comments=False):
+    if not results:
+        return []
+    
     posts = []
     cursor = db().cursor()
-    for post in results:
-        cursor.execute(
-            "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = %s",
-            (post["id"],),
-        )
-        post["comment_count"] = cursor.fetchone()["count"]
-
-        query = (
-            "SELECT * FROM `comments` WHERE `post_id` = %s ORDER BY `created_at` DESC"
-        )
+    
+    # 投稿IDとユーザーIDを収集
+    post_ids = [post["id"] for post in results]
+    user_ids = list(set(post["user_id"] for post in results))
+    
+    # 一括でコメント数を取得
+    cursor.execute(
+        "SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN %s GROUP BY post_id",
+        (post_ids,)
+    )
+    comment_counts = {row["post_id"]: row["count"] for row in cursor.fetchall()}
+    
+    # 一括でコメントとユーザー情報を取得
+    if all_comments:
+        cursor.execute("""
+            SELECT c.*, u.id as comment_user_id, u.account_name as comment_user_account_name, 
+                   u.del_flg as comment_user_del_flg, u.authority as comment_user_authority,
+                   u.created_at as comment_user_created_at, u.passhash as comment_user_passhash
+            FROM comments c 
+            JOIN users u ON c.user_id = u.id 
+            WHERE c.post_id IN %s 
+            ORDER BY c.post_id, c.created_at DESC
+        """, (post_ids,))
+    else:
+        # サブクエリを使用して各投稿の最新3件のコメントのみ取得
+        cursor.execute("""
+            SELECT c.*, u.id as comment_user_id, u.account_name as comment_user_account_name, 
+                   u.del_flg as comment_user_del_flg, u.authority as comment_user_authority,
+                   u.created_at as comment_user_created_at, u.passhash as comment_user_passhash
+            FROM (
+                SELECT c1.*, ROW_NUMBER() OVER (PARTITION BY c1.post_id ORDER BY c1.created_at DESC) as rn
+                FROM comments c1
+                WHERE c1.post_id IN %s
+            ) c
+            JOIN users u ON c.user_id = u.id 
+            WHERE c.rn <= 3
+            ORDER BY c.post_id, c.created_at DESC
+        """, (post_ids,))
+    
+    # コメントデータを投稿ごとにグループ化
+    comments_by_post = {}
+    for row in cursor.fetchall():
+        post_id = row["post_id"]
+        if post_id not in comments_by_post:
+            comments_by_post[post_id] = []
         
-        if not all_comments:
-            query += " LIMIT 3"
+        # コメントユーザー情報を構築
+        comment_user = {
+            "id": row["comment_user_id"],
+            "account_name": row["comment_user_account_name"],
+            "del_flg": row["comment_user_del_flg"],
+            "authority": row["comment_user_authority"],
+            "created_at": row["comment_user_created_at"],
+            "passhash": row["comment_user_passhash"]
+        }
+        
+        comment = {
+            "id": row["id"],
+            "post_id": row["post_id"],
+            "user_id": row["user_id"],
+            "comment": row["comment"],
+            "created_at": row["created_at"],
+            "user": comment_user
+        }
+        comments_by_post[post_id].append(comment)
+    
+    # 一括で投稿ユーザー情報を取得
+    cursor.execute("SELECT * FROM users WHERE id IN %s", (user_ids,))
+    users_by_id = {user["id"]: user for user in cursor.fetchall()}
+    
+    # データを組み立て
+    for post in results:
+        post["comment_count"] = comment_counts.get(post["id"], 0)
+        post_comments = comments_by_post.get(post["id"], [])
+        # コメントを古い順に並び替え（reverseと同じ効果）
+        post_comments.reverse()
+        post["comments"] = post_comments
+        post["user"] = users_by_id.get(post["user_id"])
 
-        cursor.execute(query, (post["id"],))
-        comments = list(cursor)
-        for comment in comments:
-            cursor.execute(
-                "SELECT * FROM `users` WHERE `id` = %s", (comment["user_id"],)
-            )
-            comment["user"] = cursor.fetchone()
-        comments.reverse()
-        post["comments"] = comments
-
-        cursor.execute("SELECT * FROM `users` WHERE `id` = %s", (post["user_id"],))
-        post["user"] = cursor.fetchone()
-
-        if not post["user"]["del_flg"]:
+        if post["user"] and not post["user"]["del_flg"]:
             posts.append(post)
 
         if len(posts) >= POSTS_PER_PAGE:
             break
+    
     return posts
 
 
@@ -286,7 +361,8 @@ def get_index():
 
     cursor = db().cursor()
     cursor.execute(
-        "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC"
+        "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC LIMIT %s",
+        (POSTS_PER_PAGE * 2,)  # 余裕を持ってフィルタリング後に十分な数を確保
     )
     posts = make_posts(cursor.fetchall())
 
@@ -362,7 +438,8 @@ def get_posts():
         )
     else:
         cursor.execute(
-            "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE ORDER BY `created_at` DESC"
+            "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT %s",
+            (POSTS_PER_PAGE * 2,)
         )
     results = cursor.fetchall()
     posts = make_posts(results)
@@ -417,8 +494,33 @@ def post_index():
     cursor = db().cursor()
     cursor.execute(query, (me["id"], mime, imgdata, flask.request.form.get("body")))
     pid = cursor.lastrowid
+    
+    # 画像をファイルシステムにも保存
+    save_image_to_file(pid, imgdata, mime)
+    
     return flask.redirect("/posts/%d" % pid)
 
+
+def save_image_to_file(post_id, imgdata, mime):
+    """画像をファイルシステムに保存"""
+    ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}
+    ext = ext_map.get(mime)
+    if not ext:
+        return None
+    
+    # ディレクトリが存在しない場合は作成
+    os.makedirs(IMAGE_STORAGE_DIR, exist_ok=True)
+    
+    filename = f"{post_id}.{ext}"
+    filepath = os.path.join(IMAGE_STORAGE_DIR, filename)
+    
+    try:
+        with open(filepath, "wb") as f:
+            f.write(imgdata)
+        return filename
+    except Exception as e:
+        flask.current_app.logger.error(f"Failed to save image {filename}: {e}")
+        return None
 
 @app.route("/image/<id>.<ext>")
 def get_image(id, ext):
@@ -428,22 +530,33 @@ def get_image(id, ext):
     if id == 0:
         return ""
 
+    # まずファイルシステムから画像を探す
+    filepath = os.path.join(IMAGE_STORAGE_DIR, f"{id}.{ext}")
+    if os.path.exists(filepath):
+        mime_map = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif"}
+        mime = mime_map.get(ext)
+        if mime:
+            return flask.send_file(filepath, mimetype=mime)
+
+    # ファイルが存在しない場合、データベースから取得してファイルに保存
     cursor = db().cursor()
-    cursor.execute("SELECT * FROM `posts` WHERE `id` = %s", (id,))
+    cursor.execute("SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = %s", (id,))
     post = cursor.fetchone()
+    
+    if not post:
+        flask.abort(404)
 
     mime = post["mime"]
-    if (
-        ext == "jpg"
-        and mime == "image/jpeg"
-        or ext == "png"
-        and mime == "image/png"
-        or ext == "gif"
-        and mime == "image/gif"
-    ):
-        return flask.Response(post["imgdata"], mimetype=mime)
-
-    flask.abort(404)
+    ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}
+    expected_ext = ext_map.get(mime)
+    
+    if ext != expected_ext:
+        flask.abort(404)
+    
+    # ファイルに保存
+    save_image_to_file(id, post["imgdata"], mime)
+    
+    return flask.Response(post["imgdata"], mimetype=mime)
 
 
 @app.route("/comment", methods=["POST"])
