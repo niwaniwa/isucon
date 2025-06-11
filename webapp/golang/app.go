@@ -74,6 +74,9 @@ func init() {
 	memcacheClient := memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	
+	// Initialize image cache
+	InitImageCache()
 }
 
 func dbInitialize() {
@@ -132,11 +135,33 @@ func digest(src string) string {
 }
 
 func calculateSalt(accountName string) string {
-	return calculateSaltNative(accountName)
+	return digest(accountName)
 }
 
 func calculatePasshash(accountName, password string) string {
-	return calculatePasshashNative(accountName, password)
+	return digest(password + ":" + calculateSalt(accountName))
+}
+
+// calculatePasshashNative is a Go-native implementation for password hashing
+func calculatePasshashNative(accountName, password string) string {
+	// For now, use the same implementation as calculatePasshash
+	// In production, you might want to use a more secure hashing algorithm
+	return calculatePasshash(accountName, password)
+}
+
+// initImageDir initializes the image storage directory
+func initImageDir() error {
+	imageDir := os.Getenv("ISUCONP_IMAGE_DIR")
+	if imageDir == "" {
+		imageDir = "/var/www/images"
+	}
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(imageDir, 0755); err != nil {
+		return fmt.Errorf("failed to create image directory: %w", err)
+	}
+	
+	return nil
 }
 
 func getSession(r *http.Request) *sessions.Session {
@@ -166,6 +191,7 @@ func getSessionUser(r *http.Request) User {
 	}
 
 	u := User{}
+
 	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
@@ -194,57 +220,42 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
-	
-	// Collect all post IDs and user IDs
-	postIDs := make([]int, 0, len(results))
-	userIDs := make([]int, 0, len(results))
-	for _, p := range results {
-		postIDs = append(postIDs, p.ID)
-		userIDs = append(userIDs, p.UserID)
-	}
-	
-	// Batch get all users
-	userMap, err := batchGetUsers(userIDs)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Batch get comment counts
-	commentCounts, err := getCommentCounts(postIDs)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Batch get comments
-	limit := 0
-	if !allComments {
-		limit = 3
-	}
-	commentsMap, err := batchGetComments(postIDs, limit)
-	if err != nil {
-		return nil, err
-	}
 
 	for _, p := range results {
-		// Set comment count
-		p.CommentCount = commentCounts[p.ID]
-		
-		// Set comments
-		if comments, ok := commentsMap[p.ID]; ok {
-			// reverse for chronological order
-			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-				comments[i], comments[j] = comments[j], comments[i]
+		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		if !allComments {
+			query += " LIMIT 3"
+		}
+		var comments []Comment
+		err = db.Select(&comments, query, p.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := 0; i < len(comments); i++ {
+			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			if err != nil {
+				return nil, err
 			}
-			p.Comments = comments
-		} else {
-			p.Comments = []Comment{}
 		}
-		
-		// Set user
-		if user, ok := userMap[p.UserID]; ok {
-			p.User = *user
+
+		// reverse
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
 		}
-		
+
+		p.Comments = comments
+
+		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		if err != nil {
+			return nil, err
+		}
+
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
@@ -298,6 +309,10 @@ func getTemplPath(filename string) string {
 
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	dbInitialize()
+	// Clear image cache on initialize
+	if imageCache != nil {
+		imageCache.ClearCache()
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -309,14 +324,10 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpl, err := getTemplate("layout.html", nil,
+	template.Must(template.ParseFiles(
 		getTemplPath("layout.html"),
-		getTemplPath("login.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, struct {
+		getTemplPath("login.html")),
+	).Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -352,14 +363,10 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpl, err := getTemplate("layout.html", nil,
+	template.Must(template.ParseFiles(
 		getTemplPath("layout.html"),
-		getTemplPath("register.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, struct {
+		getTemplPath("register.html")),
+	).Execute(w, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -463,16 +470,12 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		"imageURL": imageURL,
 	}
 
-	tmpl, err := getTemplate("layout.html", fmap,
+	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("index.html"),
 		getTemplPath("posts.html"),
-		getTemplPath("post.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, struct {
+		getTemplPath("post.html"),
+	)).Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
@@ -481,7 +484,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
-	accountName := chi.URLParam(r, "accountName")
+	accountName := r.PathValue("accountName")
 	user := User{}
 
 	err := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", accountName)
@@ -497,8 +500,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	// Limit posts per user page
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage*2)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -552,16 +554,12 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		"imageURL": imageURL,
 	}
 
-	tmpl, err := getTemplate("layout.html", fmap,
+	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("user.html"),
 		getTemplPath("posts.html"),
-		getTemplPath("post.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, struct {
+		getTemplPath("post.html"),
+	)).Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -590,8 +588,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	// Add LIMIT to avoid loading too many posts
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*2)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
@@ -612,18 +609,14 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		"imageURL": imageURL,
 	}
 
-	tmpl, err := getTemplate("posts.html", fmap,
+	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
 		getTemplPath("posts.html"),
-		getTemplPath("post.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, posts)
+		getTemplPath("post.html"),
+	)).Execute(w, posts)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
-	pidStr := chi.URLParam(r, "id")
+	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -631,8 +624,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	// Select only needed columns
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
+	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -657,15 +649,11 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		"imageURL": imageURL,
 	}
 
-	tmpl, err := getTemplate("layout.html", fmap,
+	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("post_id.html"),
-		getTemplPath("post.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, struct {
+		getTemplPath("post.html"),
+	)).Execute(w, struct {
 		Post Post
 		Me   User
 	}{p, me})
@@ -728,13 +716,12 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// First save to database with empty imgdata
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		[]byte{}, // Empty imgdata to save space
+		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -747,17 +734,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	
-	// Save image to filesystem
-	err = saveImageToFile(int(pid), mime, filedata)
-	if err != nil {
-		log.Print("Failed to save image to file:", err)
-		// Fallback: update database with image data
-		_, updateErr := db.Exec("UPDATE posts SET imgdata = ? WHERE id = ?", filedata, pid)
-		if updateErr != nil {
-			log.Print("Failed to update image in database:", updateErr)
-		}
-	}
 
 	// Invalidate posts caches
 	if redisClient != nil {
@@ -768,41 +744,47 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
-	pidStr := chi.URLParam(r, "id")
+	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	ext := chi.URLParam(r, "ext")
-	
-	// First try to load from filesystem
-	imgdata, err := loadImageFromFile(pid, ext)
-	if err == nil {
-		// Found in filesystem
-		mime := ""
-		switch ext {
-		case "jpg":
-			mime = "image/jpeg"
-		case "png":
-			mime = "image/png"
-		case "gif":
-			mime = "image/gif"
-		default:
-			w.WriteHeader(http.StatusNotFound)
+	ext := r.PathValue("ext")
+
+	// Try to get image from cache first
+	if cached, found := imageCache.Get(pid); found {
+		// Verify extension matches MIME type
+		if (ext == "jpg" && cached.Mime == "image/jpeg") ||
+			(ext == "png" && cached.Mime == "image/png") ||
+			(ext == "gif" && cached.Mime == "image/gif") {
+			
+			// Set cache headers
+			w.Header().Set("Content-Type", cached.Mime)
+			w.Header().Set("Content-Length", strconv.Itoa(len(cached.Data)))
+			w.Header().Set("Cache-Control", "public, max-age=31536000") // 1 year
+			w.Header().Set("Last-Modified", time.Now().Add(-24*time.Hour).Format(http.TimeFormat))
+			
+			// Set ETag
+			etag := fmt.Sprintf(`"post-%d"`, pid)
+			w.Header().Set("ETag", etag)
+			
+			// Check If-None-Match header for conditional requests
+			if match := r.Header.Get("If-None-Match"); match == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			
+			_, err := w.Write(cached.Data)
+			if err != nil {
+				log.Print(err)
+			}
 			return
 		}
-		w.Header().Set("Content-Type", mime)
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		_, err := w.Write(imgdata)
-		if err != nil {
-			log.Print(err)
-		}
-		return
 	}
 
-	// Fallback to database (for migration period)
+	// Cache miss - get from database
 	post := Post{}
 	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
@@ -811,18 +793,26 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		// Save to filesystem for next time
-		go copyImageData(post.ID, post.Mime, post.Imgdata)
+	if (ext == "jpg" && post.Mime == "image/jpeg") ||
+		(ext == "png" && post.Mime == "image/png") ||
+		(ext == "gif" && post.Mime == "image/gif") {
 		
+		// Store in cache for future requests
+		imageCache.Set(pid, post.Imgdata, post.Mime)
+		
+		// Set response headers
 		w.Header().Set("Content-Type", post.Mime)
-		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Header().Set("Content-Length", strconv.Itoa(len(post.Imgdata)))
+		w.Header().Set("Cache-Control", "public, max-age=31536000") // 1 year
+		w.Header().Set("Last-Modified", time.Now().Add(-24*time.Hour).Format(http.TimeFormat))
+		
+		// Set ETag
+		etag := fmt.Sprintf(`"post-%d"`, pid)
+		w.Header().Set("ETag", etag)
+		
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
 			log.Print(err)
-			return
 		}
 		return
 	}
@@ -884,14 +874,10 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpl, err := getTemplate("layout.html", nil,
+	template.Must(template.ParseFiles(
 		getTemplPath("layout.html"),
-		getTemplPath("banned.html"))
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	tmpl.Execute(w, struct {
+		getTemplPath("banned.html")),
+	).Execute(w, struct {
 		Users     []User
 		Me        User
 		CSRFToken string
@@ -930,6 +916,26 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
+// getCacheStats returns cache statistics as JSON
+func getCacheStats(w http.ResponseWriter, r *http.Request) {
+	stats := imageCache.GetCacheStats()
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Simple JSON response
+	response := fmt.Sprintf(`{
+		"memory_items": %v,
+		"memory_usage_mb": %v,
+		"memory_limit_mb": %v,
+		"cache_directory": "%s"
+	}`, 
+		stats["memory_items"],
+		stats["memory_usage_mb"],
+		stats["memory_limit_mb"],
+		stats["cache_directory"])
+	
+	w.Write([]byte(response))
+}
+
 func main() {
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
@@ -964,7 +970,7 @@ func main() {
 
 	db, err = sqlx.Open("mysql", dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
 	
@@ -988,7 +994,14 @@ func main() {
 
 	r := chi.NewRouter()
 
+	// Apply middleware
+	r.Use(SecurityHeadersMiddleware)
+	r.Use(CacheControlMiddleware)
+	r.Use(GzipMiddleware)
+	r.Use(LoggingMiddleware)
+	r.Use(ETagMiddleware)
 	r.Get("/initialize", getInitialize)
+	r.Get("/admin/cache/stats", getCacheStats)
 	r.Get("/login", getLogin)
 	r.Post("/login", postLogin)
 	r.Get("/register", getRegister)
