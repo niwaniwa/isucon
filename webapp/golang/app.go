@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ const (
 	postsPerPage  = 20
 	ISO8601Format = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
+	ImageDir      = "../public/images"
 )
 
 type User struct {
@@ -262,6 +264,12 @@ func getTemplPath(filename string) string {
 
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	dbInitialize()
+	
+	// 初期化時に画像をファイルシステムに移行
+	if err := migrateImagesToFileSystem(); err != nil {
+		log.Printf("Warning: Failed to migrate images to file system: %v", err)
+	}
+	
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -647,7 +655,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.Exec(
 		query,
@@ -667,6 +674,12 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ファイルシステムにも画像を保存
+	if err := saveImageToFile(int(pid), filedata, mime); err != nil {
+		log.Printf("Failed to save image to file: %v", err)
+		// ファイル保存に失敗してもデータベースには保存されているので処理を継続
+	}
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -678,19 +691,62 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
-		log.Print(err)
-		return
+	ext := r.PathValue("ext")
+
+	// まずファイルシステムから画像を読み込む
+	if imageFileExists(pid, ext) {
+		imageData, err := loadImageFromFile(pid, ext)
+		if err == nil {
+			// MIMEタイプを拡張子から決定
+			var mimeType string
+			switch ext {
+			case "jpg":
+				mimeType = "image/jpeg"
+			case "png":
+				mimeType = "image/png"
+			case "gif":
+				mimeType = "image/gif"
+			default:
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+
+			// HTTPキャッシュヘッダーを設定（1年間キャッシュ）
+			w.Header().Set("Content-Type", mimeType)
+			w.Header().Set("Cache-Control", "public, max-age=31536000")
+			w.Header().Set("Expires", time.Now().AddDate(1, 0, 0).Format(http.TimeFormat))
+
+			_, err := w.Write(imageData)
+			if err != nil {
+				log.Print(err)
+			}
+			return
+		}
 	}
 
-	ext := r.PathValue("ext")
+	// ファイルが存在しない場合はデータベースからフォールバック
+	post := Post{}
+	err = db.Get(&post, "SELECT `id`, `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
+		
+		// ファイルシステムに保存（次回からはファイルから読み込める）
+		if err := saveImageToFile(post.ID, post.Imgdata, post.Mime); err != nil {
+			log.Printf("Failed to save image to file: %v", err)
+		}
+
+		// HTTPキャッシュヘッダーを設定
 		w.Header().Set("Content-Type", post.Mime)
+		w.Header().Set("Cache-Control", "public, max-age=31536000")
+		w.Header().Set("Expires", time.Now().AddDate(1, 0, 0).Format(http.TimeFormat))
+
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
 			log.Print(err)
@@ -791,6 +847,107 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
+// 画像をファイルシステムに保存する関数
+func saveImageToFile(postID int, imageData []byte, mime string) error {
+	ext := ""
+	switch mime {
+	case "image/jpeg":
+		ext = "jpg"
+	case "image/png":
+		ext = "png"
+	case "image/gif":
+		ext = "gif"
+	default:
+		return fmt.Errorf("unsupported mime type: %s", mime)
+	}
+
+	fileName := fmt.Sprintf("%d.%s", postID, ext)
+	filePath := filepath.Join(ImageDir, fileName)
+
+	// ディレクトリが存在しない場合は作成
+	if err := os.MkdirAll(ImageDir, 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filePath, imageData, 0644)
+}
+
+// ファイルシステムから画像を読み込む関数
+func loadImageFromFile(postID int, ext string) ([]byte, error) {
+	fileName := fmt.Sprintf("%d.%s", postID, ext)
+	filePath := filepath.Join(ImageDir, fileName)
+
+	return os.ReadFile(filePath)
+}
+
+// 画像ファイルが存在するかチェックする関数
+func imageFileExists(postID int, ext string) bool {
+	fileName := fmt.Sprintf("%d.%s", postID, ext)
+	filePath := filepath.Join(ImageDir, fileName)
+	
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+// 既存の画像をデータベースからファイルシステムに移行する関数
+func migrateImagesToFileSystem() error {
+	log.Println("Starting migration of images to file system...")
+	
+	// ディレクトリが存在しない場合は作成
+	if err := os.MkdirAll(ImageDir, 0755); err != nil {
+		return fmt.Errorf("failed to create image directory: %v", err)
+	}
+
+	rows, err := db.Query("SELECT `id`, `mime`, `imgdata` FROM `posts` WHERE `imgdata` IS NOT NULL")
+	if err != nil {
+		return fmt.Errorf("failed to query posts: %v", err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var id int
+		var mime string
+		var imgdata []byte
+		
+		if err := rows.Scan(&id, &mime, &imgdata); err != nil {
+			log.Printf("Failed to scan row: %v", err)
+			continue
+		}
+
+		// ファイルが既に存在する場合はスキップ
+		ext := ""
+		switch mime {
+		case "image/jpeg":
+			ext = "jpg"
+		case "image/png":
+			ext = "png"
+		case "image/gif":
+			ext = "gif"
+		default:
+			log.Printf("Unknown mime type for post %d: %s", id, mime)
+			continue
+		}
+
+		if imageFileExists(id, ext) {
+			continue
+		}
+
+		if err := saveImageToFile(id, imgdata, mime); err != nil {
+			log.Printf("Failed to save image for post %d: %v", id, err)
+			continue
+		}
+
+		count++
+		if count%100 == 0 {
+			log.Printf("Migrated %d images...", count)
+		}
+	}
+
+	log.Printf("Migration completed. Migrated %d images to file system.", count)
+	return nil
+}
+
 func main() {
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
@@ -822,12 +979,16 @@ func main() {
 		port,
 		dbname,
 	)
-
 	db, err = sqlx.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	// 既存の画像をファイルシステムに移行
+	if err := migrateImagesToFileSystem(); err != nil {
+		log.Printf("Warning: Failed to migrate images to file system: %v", err)
+	}
 
 	r := chi.NewRouter()
 
