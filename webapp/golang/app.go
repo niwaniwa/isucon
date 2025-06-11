@@ -98,9 +98,10 @@ func tryLogin(accountName, password string) *User {
 	}
 
 	if calculatePasshashNative(u.AccountName, password) == u.Passhash {
-		// Cache the user on successful login
-		cacheKey := fmt.Sprintf("user:%d", u.ID)
-		userCache.Set(cacheKey, u, 5*time.Minute)
+		// Cache the user in Redis on successful login
+		if redisClient != nil {
+			setUserCache(u, 5*time.Minute)
+		}
 		return &u
 	} else {
 		return nil
@@ -151,10 +152,17 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	// Check cache first
-	cacheKey := fmt.Sprintf("user:%v", uid)
-	if cached, found := userCache.Get(cacheKey); found {
-		return cached.(User)
+	// Convert uid to int
+	userID, ok := uid.(int)
+	if !ok {
+		return User{}
+	}
+
+	// Check Redis cache first
+	if redisClient != nil {
+		if user, err := getUserFromCache(userID); err == nil && user != nil {
+			return *user
+		}
 	}
 
 	u := User{}
@@ -163,8 +171,10 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	// Cache for 5 minutes
-	userCache.Set(cacheKey, u, 5*time.Minute)
+	// Cache in Redis for 5 minutes
+	if redisClient != nil {
+		setUserCache(u, 5*time.Minute)
+	}
 
 	return u
 }
@@ -418,19 +428,35 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
-
-	// Limit the initial query to avoid loading too many posts
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*2)
-	if err != nil {
-		log.Print(err)
-		return
+	// Try Redis cache first
+	cacheKey := "posts:index:latest"
+	var posts []Post
+	if redisClient != nil {
+		cachedPosts, err := getPostsFromCache(cacheKey)
+		if err == nil && cachedPosts != nil {
+			posts = cachedPosts
+		}
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
+	if posts == nil {
+		results := []Post{}
+		// Limit the initial query to avoid loading too many posts
+		err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*2)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		posts, err = makePosts(results, getCSRFToken(r), false)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// Cache for 30 seconds
+		if redisClient != nil && len(posts) > 0 {
+			setPostsCache(cacheKey, posts, 30*time.Second)
+		}
 	}
 
 	fmap := template.FuncMap{
@@ -733,6 +759,11 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Invalidate posts caches
+	if redisClient != nil {
+		invalidatePostsCaches()
+	}
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -822,6 +853,13 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Print(err)
 		return
+	}
+
+	// Invalidate comment count cache
+	if redisClient != nil {
+		invalidateCommentCountCache(postID)
+		// Also invalidate posts cache as comment count changed
+		invalidatePostsCaches()
 	}
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
@@ -938,6 +976,14 @@ func main() {
 	// Initialize image directory
 	if err := initImageDir(); err != nil {
 		log.Fatalf("Failed to initialize image directory: %s", err.Error())
+	}
+	
+	// Initialize Redis
+	if err := initRedis(); err != nil {
+		log.Printf("Failed to initialize Redis (will continue without cache): %s", err.Error())
+		// Continue without Redis cache
+	} else {
+		log.Print("Redis initialized successfully")
 	}
 
 	r := chi.NewRouter()
