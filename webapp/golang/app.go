@@ -428,35 +428,19 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	// Try Redis cache first
-	cacheKey := "posts:index:latest"
-	var posts []Post
-	if redisClient != nil {
-		cachedPosts, err := getPostsFromCache(cacheKey)
-		if err == nil && cachedPosts != nil {
-			posts = cachedPosts
-		}
+	results := []Post{}
+
+	// Limit the initial query to avoid loading too many posts
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
+	if err != nil {
+		log.Print(err)
+		return
 	}
 
-	if posts == nil {
-		results := []Post{}
-		// Limit the initial query to avoid loading too many posts
-		err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*2)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-
-		posts, err = makePosts(results, getCSRFToken(r), false)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-
-		// Cache for 30 seconds
-		if redisClient != nil && len(posts) > 0 {
-			setPostsCache(cacheKey, posts, 30*time.Second)
-		}
+	posts, err := makePosts(results, getCSRFToken(r), false)
+	if err != nil {
+		log.Print(err)
+		return
 	}
 
 	fmap := template.FuncMap{
@@ -498,7 +482,8 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	results := []Post{}
 
 	// Limit posts per user page
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage*2)
+	// err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage*2)
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
@@ -591,7 +576,8 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 	// Add LIMIT to avoid loading too many posts
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*2)
+	// err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*2)
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
@@ -632,7 +618,8 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 	// Select only needed columns
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.created_at, p.mime, u.account_name FROM `posts` AS p JOIN `users` AS u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT ?", postsPerPage*2)
+
 	if err != nil {
 		log.Print(err)
 		return
@@ -759,11 +746,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Invalidate posts caches
-	if redisClient != nil {
-		invalidatePostsCaches()
-	}
-
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -853,13 +835,6 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Print(err)
 		return
-	}
-
-	// Invalidate comment count cache
-	if redisClient != nil {
-		invalidateCommentCountCache(postID)
-		// Also invalidate posts cache as comment count changed
-		invalidatePostsCaches()
 	}
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
