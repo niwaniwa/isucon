@@ -194,7 +194,7 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
-	
+
 	// Collect all post IDs and user IDs
 	postIDs := make([]int, 0, len(results))
 	userIDs := make([]int, 0, len(results))
@@ -202,19 +202,19 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		postIDs = append(postIDs, p.ID)
 		userIDs = append(userIDs, p.UserID)
 	}
-	
+
 	// Batch get all users
 	userMap, err := batchGetUsers(userIDs)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Batch get comment counts
 	commentCounts, err := getCommentCounts(postIDs)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Batch get comments
 	limit := 0
 	if !allComments {
@@ -228,7 +228,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	for _, p := range results {
 		// Set comment count
 		p.CommentCount = commentCounts[p.ID]
-		
+
 		// Set comments
 		if comments, ok := commentsMap[p.ID]; ok {
 			// reverse for chronological order
@@ -239,17 +239,17 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		} else {
 			p.Comments = []Comment{}
 		}
-		
+
 		// Set user
 		if user, ok := userMap[p.UserID]; ok {
 			p.User = *user
 		}
-		
+
 		p.CSRFToken = csrfToken
 		posts = append(posts, p)
 	}
 
-	return posts, nil 
+	return posts, nil
 }
 
 func imageURL(p Post) string {
@@ -752,13 +752,13 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// First save to database with empty imgdata
+	// Save to database with image data (for fallback)
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		[]byte{}, // Empty imgdata to save space
+		filedata, // Save actual image data for fallback
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -771,16 +771,12 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	
-	// Save image to filesystem
+
+	// Also save image to filesystem for nginx to serve
 	err = saveImageToFile(int(pid), mime, filedata)
 	if err != nil {
-		log.Print("Failed to save image to file:", err)
-		// Fallback: update database with image data
-		_, updateErr := db.Exec("UPDATE posts SET imgdata = ? WHERE id = ?", filedata, pid)
-		if updateErr != nil {
-			log.Print("Failed to update image in database:", updateErr)
-		}
+		log.Printf("Failed to save image to file: %v", err)
+		// Image is in DB, so service will still work
 	}
 
 	// Invalidate caches
@@ -801,7 +797,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ext := chi.URLParam(r, "ext")
-	
+
 	// First try to load from filesystem
 	imgdata, err := loadImageFromFile(pid, ext)
 	if err == nil {
@@ -827,7 +823,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fallback to database (for migration period)
+	// Fallback to database
 	post := Post{}
 	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
@@ -839,11 +835,15 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
-		// Save to filesystem for next time
-		go copyImageData(post.ID, post.Mime, post.Imgdata)
-		
+		// Save to filesystem immediately (synchronously) for nginx to serve next time
+		err = saveImageToFile(post.ID, post.Mime, post.Imgdata)
+		if err != nil {
+			log.Printf("Failed to save image %d to file: %v", post.ID, err)
+		}
+
 		w.Header().Set("Content-Type", post.Mime)
 		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Header().Set("X-Image-Cached", "from-db")
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
 			log.Print(err)
@@ -992,17 +992,17 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
-	
+
 	// Configure connection pool
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
-	
+
 	// Initialize image directory
 	if err := initImageDir(); err != nil {
 		log.Fatalf("Failed to initialize image directory: %s", err.Error())
 	}
-	
+
 	// Initialize Redis
 	if err := initRedis(); err != nil {
 		log.Printf("Failed to initialize Redis (will continue without cache): %s", err.Error())
