@@ -142,6 +142,28 @@ func calculatePasshash(accountName, password string) string {
 	return digest(password + ":" + calculateSalt(accountName))
 }
 
+// calculatePasshashNative is a Go-native implementation for password hashing
+func calculatePasshashNative(accountName, password string) string {
+	// For now, use the same implementation as calculatePasshash
+	// In production, you might want to use a more secure hashing algorithm
+	return calculatePasshash(accountName, password)
+}
+
+// initImageDir initializes the image storage directory
+func initImageDir() error {
+	imageDir := os.Getenv("ISUCONP_IMAGE_DIR")
+	if imageDir == "" {
+		imageDir = "/var/www/images"
+	}
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(imageDir, 0755); err != nil {
+		return fmt.Errorf("failed to create image directory: %w", err)
+	}
+	
+	return nil
+}
+
 func getSession(r *http.Request) *sessions.Session {
 	session, _ := store.Get(r, "isuconp-go.session")
 

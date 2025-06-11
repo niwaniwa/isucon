@@ -156,3 +156,49 @@ func invalidateCommentCountCache(postID int) error {
 	key := fmt.Sprintf("comment_count:%d", postID)
 	return redisClient.Del(ctx, key).Err()
 }
+
+// Posts cache functions
+
+// getPostsFromCache gets posts from Redis cache
+func getPostsFromCache(cacheKey string) ([]Post, error) {
+	val, err := redisClient.Get(ctx, cacheKey).Result()
+	if err == redis.Nil {
+		return nil, nil // Cache miss
+	} else if err != nil {
+		return nil, err
+	}
+
+	var posts []Post
+	err = json.Unmarshal([]byte(val), &posts)
+	if err != nil {
+		return nil, err
+	}
+
+	return posts, nil
+}
+
+// setPostsCache sets posts in Redis cache
+func setPostsCache(cacheKey string, posts []Post, expiration time.Duration) error {
+	data, err := json.Marshal(posts)
+	if err != nil {
+		return err
+	}
+
+	return redisClient.Set(ctx, cacheKey, data, expiration).Err()
+}
+
+// invalidatePostsCaches invalidates all posts-related caches
+func invalidatePostsCaches() error {
+	// Get all keys matching posts:*
+	keys, err := redisClient.Keys(ctx, "posts:*").Result()
+	if err != nil {
+		return err
+	}
+
+	// Delete all matching keys
+	if len(keys) > 0 {
+		return redisClient.Del(ctx, keys...).Err()
+	}
+
+	return nil
+}
